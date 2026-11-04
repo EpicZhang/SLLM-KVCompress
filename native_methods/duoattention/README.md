@@ -1,69 +1,109 @@
-# Scheme A — Functional physical DuoAttention port in the locked TEAM environment
+# Native DuoAttention — Physical Dual KV Cache
 
-**Status:** prototype. CPU cache unit tests passed on the authoring machine. GPU model integration, accuracy, speed, and memory **have not yet been verified on the user's RunPod A100**. Never report this as the original authors' kernel or as an achieved paper result until independently validated.
+**Status:** Implementation and RULER evaluation completed on **RunPod NVIDIA A100-SXM4-80GB**. The final results cover 32K, 64K, and 128K context lengths, plus an 18-trial paired performance benchmark.
 
-This add-only package implements retrieval heads with full persistent KV and streaming heads with physical **sink + recent** KV. It uses a custom attention forward on top of Transformers **5.2.0 LlamaAttention**, Torch SDPA, and the team's fixed trained head pattern. Chunked prefill updates physical cache after every chunk; decode appends without retaining pruned KV.
+This directory contains the team's **independent functional PyTorch implementation** of DuoAttention-style retrieval/streaming heads. It integrates with the project’s pinned Transformers 5.2.0 Llama model and keeps physically separate, compact KV tensors for retrieval and streaming attention.
 
-This is a functional *port of the algorithm*, NOT a copy or validated drop-in of MIT's optimized FlashAttention/FlashInfer implementation. Performance may be **worse** than full attention because of two attention calls, head selection, mask construction and chunked processing. Physical KV bytes should be less; end-to-end peak memory and speed must be measured separately.
+**Reports:** [Method results and analysis](../../reports/duoattention-method-report.md) · [Archived experiment results](../../methods/duoattention_r0.5/README.md)
 
-No file in `scripts/`, `baselines/`, `splits/`, `configs/`, `requirements.lock.txt` or `README.md` is modified. This method does **not** auto-push to GitHub. Results are separate under `results/*_duoattention_native_*`.
+## How it works
 
-## On RunPod A100 — install
+The frozen 32 × 8 head pattern in [`assets/duoattention_pattern/`](../../assets/duoattention_pattern/) specifies the ranking used to assign head groups. The budget planner chooses a set of **retrieval heads** (complete historical KV) and **streaming heads** (128 sink tokens + 256 recent tokens). Streaming KV is physically compacted after each prefill chunk and during decoding.
 
-1. Upload `duoattention-native-team-cuda13.zip` to `/workspace/kvcompress/KVCompress-survey/` and unpack there:
+- **Retrieval attention:** full historical KV with a Flash SDPA-compatible lower-right causal bias.
+- **Streaming attention:** sink + recent KV with absolute-position causal masking.
+- **Prefill:** chunked processing, with 512-token chunks in the final experiments.
+- **Decode:** one-token steps using absolute `cache_position`; the custom cache owns the retained KV tensors.
+- **Paired control:** `--mode full` uses the same custom attention adapter with all groups in retrieval mode, so its KV cache remains uncompressed.
 
-   ```bash
-   cd /workspace/kvcompress/KVCompress-survey
-   unzip -o duoattention-native-team-cuda13.zip
-   source .venv/bin/activate
-   export HF_HOME=/workspace/kvcompress/hf
-   ```
+At target `r = 0.5`, head assignment was **126 retrieval / 130 streaming groups at 32K**, and **127 / 129 groups at 64K and 128K**. The head pattern and runtime settings are loaded through [`configs/duoattention.json`](../../configs/duoattention.json), [`scripts/presses/duoattention_utils.py`](../../scripts/presses/duoattention_utils.py) and the assets directory.
 
-2. Inspect the unchanged environment and official head pattern:
+## Experimental environment
 
-   ```bash
-   python -m native_methods.duoattention.preflight
-   python -m unittest discover -s tests/native_duoattention -v
-   ```
+| Component | Final experimental setting |
+|---|---|
+| GPU | NVIDIA A100-SXM4-80GB (RunPod) |
+| Model | `meta-llama/Llama-3.1-8B-Instruct`, BF16 |
+| Python | 3.11.18 |
+| PyTorch / CUDA | `2.14.1+cu130` / CUDA runtime 13.0 |
+| Transformers / kvpress | `5.2.0` / `0.5.5` |
+| RULER | Pinned team seed-0 splits; 650/650/260 examples per mode |
+| Chunk size | 512 tokens |
+| Compression target | `--compression-ratio 0.5` |
+| CUDA allocator | `PYTORCH_ALLOC_CONF=expandable_segments:True` |
 
-3. After the tiny Transformer integration test passes, run small **two-mode** physical cache smoke tests:
+## Final RULER accuracy
 
-   ```bash
-   python -m native_methods.duoattention.runner --mode full --smoke --chunk-size 128
-   python -m native_methods.duoattention.runner --mode native --smoke --chunk-size 128
-   ```
+Full and Native results use the same custom runner, model, split files and scoring. The 32K result is from the final Flash Attention causal-bias-fix rerun.
 
-   `full` is a *paired, same-runner* baseline: **same torch SDPA, chunked prefill and prompting**, but all KV heads are retrieval and no physical cache is pruned. Compare `kv_cache_bytes`, `full_context_kv_bytes`, `physical_compression_ratio` and output. For numerical consistency, the tiny test checks that `full` matches ordinary Transformers forward for a random Llama.
+| Context | Full attention | Native DuoAttention (r=0.5) | Difference |
+|---|---:|---:|---:|
+| 32K (650 examples/mode) | 88.68% | 85.19% | −3.49 pp |
+| 64K (650 examples/mode) | 86.62% | 81.24% | −5.38 pp |
+| 128K (260 examples/mode) | 77.69% | 67.69% | −10.00 pp |
 
-4. Only after success, use the same pinned team RULER split and scoring, **one sample/task first**:
+## Paired performance benchmark
 
-   ```bash
-   python -m native_methods.duoattention.runner --mode full \
-       --context-length 32768 --per-task 1 --chunk-size 512
-   python -m native_methods.duoattention.runner --mode native \
-       --context-length 32768 --per-task 1 --compression-ratio 0.5 --chunk-size 512
-   ```
+The benchmark runs both modes on the same RunPod A100 with batch size 1, identical synthetic prompt tokens, 128 fixed continuation steps, and three repetitions per context/mode (18 trials).
 
-   This is a costly test: starts ~13 complete 32K runs. To test only one actual long-context task first, use `--smoke` or change a *copy* of the dataset script; do NOT alter common team scripts. After one-sample outputs are correct, extend both to `--per-task 50` for the team's 650 samples; runs resume from the same results directory.
+| Context | Physical KV saving | TTFT speedup | Decode speedup | Peak PyTorch allocated saving |
+|---|---:|---:|---:|---:|
+| 32K | 50.19% | 1.281× | 1.204× | 10.23% |
+| 64K | 50.10% | 1.526× | 1.522× | 16.53% |
+| 128K | 50.24% | 1.804× | 1.722× | 24.00% |
 
-   ```bash
-   python -m native_methods.duoattention.runner --mode full --context-length 32768 --per-task 50 --chunk-size 512
-   python -m native_methods.duoattention.runner --mode native --context-length 32768 --per-task 50 --compression-ratio 0.5 --chunk-size 512
-   ```
+The physical KV percentage is calculated from retained KV tensor bytes. TTFT and decode measurements refer to the paired **single-request** PyTorch benchmark. Raw trials and medians are archived in [`methods/duoattention_r0.5/performance/`](../../methods/duoattention_r0.5/performance/).
 
-## Controls and limitations
+## Code structure
 
-- **Version lock:** must be exact Transformers 5.2.0; other releases fail fast. Same `requirements.lock.txt` as H2O/SnapKV.
-- **Model:** Llama-3.1-8B-Instruct only with provided **32 × 8** pretrained KV-head pattern. No head training is performed.
-- **Batch:** one sample, no padding, BF16, greedy decode; single GPU.
-- **Chunked prefill:** physical retained state is pruned **after each chunk**, not after full context. This is not the author's fused implementation.
-- **Prompt/scoring:** invokes the exact installed `kvpress` pipeline's `preprocess()` for chat template and token IDs, and imports team's `eval_ruler.py` `score()` and `load_split()` with pinned dataset revision.
-- **Decode:** uses manually supplied absolute `cache_position` and `use_cache=False` so HF does not allocate a second DynamicCache; native physical KV is kept solely in this method's cache. Must not call `model.generate()` with this patch.
-- **Full baseline:** use `--mode full`, not the historical GCP baseline, when comparing TTFT/TPOT and overhead. For accuracy, compare both to the historical team baseline and flag any differences.
-- **Metrics:** `physical_compression_ratio` = 1 - *stored physical KV tensor bytes* / theoretical full context KV bytes. **Not** CUDA peak memory reduction. `peak_memory_bytes` is measured separately. This method's SDPA temporary buffers may make peak memory unexpectedly high.
-- **No automatic Git upload:** results only saved on `/workspace` network volume; no git push/PR.
-- **No formal correctness/performance claim:** do not submit results until `full` output is close to team baseline, native logical behavior is checked, memory is actually reduced at 4K then 32K, and all 650 samples use exactly matching seeds and data.
+| File | Purpose |
+|---|---|
+| `attention.py` | Custom Llama attention adapter, retrieval/streaming routing, and Flash SDPA causal-bias handling |
+| `dual_cache.py` | Physical dual KV cache storage, sink and recent maintenance |
+| `runner.py` | RULER evaluation in Full or Native mode, plus synthetic smoke runs |
+| `bench_performance.py` | Paired same-backend timing and memory benchmark |
+| `preflight.py` | Dependency versions, CUDA environment and frozen-pattern validation |
+| `bootstrap.sh` | Optional initialization of the original DuoAttention source checkout |
+| `smoke_official.py` | Optional smoke test of the separate upstream DuoAttention implementation |
+| `tests/native_duoattention/` | Dual-cache, causal-bias and small Transformers integration tests |
 
-If the tiny model test fails, stop there and share the full stack trace; do not run 32K and do not modify team lock versions.
+## Running the implementation
 
-References: MIT Han Lab DuoAttention paper (2025); [original implementation](https://github.com/mit-han-lab/duo-attention); pinned Transformers [v5.2.0 LlamaAttention](https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py).
+Use the pinned project dependencies from `requirements.lock.txt` and a CUDA GPU environment with access to the Llama-3.1-8B-Instruct model. All commands below run from the **repository root**:
+
+```bash
+source .venv/bin/activate
+export HF_HOME=/path/to/persistent/hf
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+
+# Environment / head-pattern verification and unit tests
+python -m native_methods.duoattention.preflight
+python -m unittest discover -s tests/native_duoattention -v
+
+# Fast functional smoke tests
+python -m native_methods.duoattention.runner --mode full --smoke --chunk-size 128
+python -m native_methods.duoattention.runner --mode native --smoke --chunk-size 128
+
+# Paired RULER 32K evaluation
+python -m native_methods.duoattention.runner --mode full \
+  --context-length 32768 --per-task 50 --compression-ratio 0.5 \
+  --chunk-size 512 --out /path/to/new-ruler-results
+python -m native_methods.duoattention.runner --mode native \
+  --context-length 32768 --per-task 50 --compression-ratio 0.5 \
+  --chunk-size 512 --out /path/to/new-ruler-results
+
+# Paired 32K / 64K / 128K performance benchmark
+python -m native_methods.duoattention.bench_performance \
+  --mode both --lengths 32768 65536 131072 \
+  --repeats 3 --decode-tokens 128 --chunk-size 512 \
+  --out /path/to/new-performance-results
+```
+
+To evaluate RULER 64K, use `--context-length 65536 --per-task 50`; for 128K, use `--context-length 131072 --per-task 20`. The team's pinned dataset revision and committed `splits/` files are used by the runner.
+
+## Source and results
+
+- [Method analysis](../../reports/duoattention-method-report.md)
+- [Final archived results and reproducibility summary](../../methods/duoattention_r0.5/README.md)
+- [Frozen head-pattern attribution](../../assets/duoattention_pattern/README.md)
+- [Original DuoAttention project](https://github.com/mit-han-lab/duo-attention)
